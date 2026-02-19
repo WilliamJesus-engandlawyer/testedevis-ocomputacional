@@ -3,6 +3,18 @@
 # (Você ainda define manualmente: plate_model_path, char_model_path, vehicle_model_path, video_path)
 # =====================================================
 
+# Instalações principais - execute essa célula primeiro
+!pip install --quiet ultralytics
+!pip install --quiet easyocr
+!pip install --quiet filterpy
+!pip install --quiet python-Levenshtein    # acelera bastante o EasyOCR em algumas situações
+!pip install --quiet opencv-python-headless # versão sem interface gráfica (mais leve e recomendada no Colab)
+
+# Opcional (mas recomendado se você for usar GPU e quiser confirmar):
+!pip install --quiet torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# ↑ só rode se o torch padrão do Colab estiver dando problema com CUDA
+
+# kgjghggggjjh
 import os
 import sys
 import csv
