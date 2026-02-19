@@ -1,8 +1,6 @@
 # =====================================================
-#ainda vou fazer explicações sobre essa nova versão, preicso fazer uns testes antes
-
-'''
-'''
+# Versão
+# (Você ainda define manualmente: plate_model_path, char_model_path, vehicle_model_path, video_path)
 # =====================================================
 
 import os
@@ -39,7 +37,13 @@ import easyocr
 
 # ------------------- EasyOCR Reader -------------------
 print("Inicializando EasyOCR (GPU recomendado)...")
-easyocr_reader = easyocr.Reader(['en'], gpu=True)  # A-Z0-9
+try:
+    import torch
+    USE_GPU_OCR = torch.cuda.is_available()
+except:
+    USE_GPU_OCR = False
+
+easyocr_reader = easyocr.Reader(['en'], gpu=USE_GPU_OCR)  # A-Z0-9
 
 # ------------------- Parâmetros -------------------
 PLATE_CONF = 0.25
@@ -109,14 +113,23 @@ def expand_bbox(bbox, pad, w, h):
         min(h - 1, y2 + pad)
     )
 
-
 def iou(bb1, bb2):
+    """
+    IoU correto: inter / (area1 + area2 - inter)
+    bb = (x1,y1,x2,y2)
+    """
     x1 = max(bb1[0], bb2[0]); y1 = max(bb1[1], bb2[1])
     x2 = min(bb1[2], bb2[2]); y2 = min(bb1[3], bb2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (bb1[2] - bb1[0]) * (bb1[3] - bb1[1])
-    area2 = (bb2[2] - bb2[0]) * (bb2[3] - bb2[1])
-    return inter / (area1 + area2) if (area1 + area2) > 0 else 0
+
+    iw = max(0, x2 - x1)
+    ih = max(0, y2 - y1)
+    inter = iw * ih
+
+    area1 = max(0, bb1[2] - bb1[0]) * max(0, bb1[3] - bb1[1])
+    area2 = max(0, bb2[2] - bb2[0]) * max(0, bb2[3] - bb2[1])
+
+    denom = (area1 + area2 - inter)
+    return (inter / denom) if denom > 0 else 0.0
 
 def associate_plate_vehicle(plate_bbox, vehicle_boxes, iou_th=0.2):
     best_iou = 0
@@ -128,27 +141,48 @@ def associate_plate_vehicle(plate_bbox, vehicle_boxes, iou_th=0.2):
             best_id = vid
     return best_id
 
-
 # ------------------- SORT Tracker -------------------
 class KalmanBoxTracker:
     count = 0
     def __init__(self, bbox):
+        # bbox: np.array([x1,y1,x2,y2])
         self.kf = KalmanFilter(dim_x=7, dim_z=4)
-        self.kf.F = np.eye(7); self.kf.F[0,4] = self.kf.F[1,5] = self.kf.F[2,6] = 1
-        self.kf.H = np.zeros((4,7)); self.kf.H[:4,:4] = np.eye(4)
-        self.kf.R[2:,2:] *= 10; self.kf.P[4:,4:] *= 1000; self.kf.P *= 10
+        self.kf.F = np.eye(7)
+        self.kf.F[0,4] = 1
+        self.kf.F[1,5] = 1
+        self.kf.F[2,6] = 1
+
+        self.kf.H = np.zeros((4,7))
+        self.kf.H[:4,:4] = np.eye(4)
+
+        self.kf.R[2:,2:] *= 10
+        self.kf.P[4:,4:] *= 1000
+        self.kf.P *= 10
+
         self.kf.x[:4] = bbox.reshape(4,1)
-        self.time_since_update = 0; self.id = KalmanBoxTracker.count
-        KalmanBoxTracker.count += 1; self.history = []; self.hits = 0; self.hit_streak = 0; self.age = 0
+
+        self.time_since_update = 0
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+
+        self.history = []
+        self.hits = 0
+        self.hit_streak = 0
+        self.age = 0
 
     def update(self, bbox):
-        self.time_since_update = 0; self.hits += 1; self.hit_streak += 1
+        self.time_since_update = 0
+        self.hits += 1
+        self.hit_streak += 1
         self.kf.update(bbox.reshape(4,1))
 
     def predict(self):
-        if self.kf.x[6] + self.kf.x[2] <= 0: self.kf.x[6] *= 0
-        self.kf.predict(); self.age += 1
-        if self.time_since_update > 0: self.hit_streak = 0
+        if self.kf.x[6] + self.kf.x[2] <= 0:
+            self.kf.x[6] *= 0
+        self.kf.predict()
+        self.age += 1
+        if self.time_since_update > 0:
+            self.hit_streak = 0
         self.time_since_update += 1
         self.history.append(self.kf.x[:4].copy())
         return self.history[-1]
@@ -157,42 +191,68 @@ class KalmanBoxTracker:
         return self.kf.x[:4].reshape(-1)
 
 class Sort:
+    """
+    Correção importante:
+    - matching com sets separados (dets vs trackers)
+    - greedy por IoU (simples e rápido)
+    """
     def __init__(self, max_age=30, min_hits=2, iou_threshold=0.3):
-        self.max_age = max_age; self.min_hits = min_hits; self.iou_threshold = iou_threshold
-        self.trackers = []; self.frame_count = 0
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.trackers = []
+        self.frame_count = 0
 
     def update(self, dets=np.empty((0,5))):
         self.frame_count += 1
-        trks = [trk.predict().reshape(-1) for trk in self.trackers]
+
+        # 1) Predição de todos os trackers
+        for trk in self.trackers:
+            trk.predict()
+
+        # 2) Remove trackers velhos
+        self.trackers = [t for t in self.trackers if t.time_since_update <= self.max_age]
+
         dets = np.asarray(dets) if len(dets) > 0 else np.empty((0,5))
 
-        ret = []
-        to_del = [i for i, t in enumerate(self.trackers) if t.time_since_update > self.max_age]
-        for i in reversed(to_del): self.trackers.pop(i)
-
+        # Se não tem detecção, retorna os válidos (por hits) que foram atualizados recentemente
         if len(dets) == 0:
+            ret = []
             for t in self.trackers:
                 if t.time_since_update < 1 and (t.hits >= self.min_hits or self.frame_count <= self.min_hits):
                     ret.append((t.get_state(), t.id))
             return ret
 
-        assigned = set()
+        # 3) Greedy matching por IoU
+        used_dets = set()
+        used_trks = set()
+
+        # Lista de pares (iou, det_idx, trk_idx)
+        pairs = []
         for d in range(len(dets)):
-            if d in assigned: continue
-            best_iou, best_t = 0, -1
+            bb_det = dets[d, :4]
             for t_idx, t in enumerate(self.trackers):
-                if t_idx in assigned: continue
-                ciou = iou(dets[d,:4], t.get_state())
-                if ciou > best_iou and ciou >= self.iou_threshold:
-                    best_iou, best_t = ciou, t_idx
-            if best_t >= 0:
-                self.trackers[best_t].update(dets[d,:4])
-                assigned.add(d); assigned.add(best_t)
+                bb_trk = t.get_state()
+                ciou = iou(bb_det, bb_trk)
+                if ciou >= self.iou_threshold:
+                    pairs.append((ciou, d, t_idx))
 
-        for i in range(len(dets)):
-            if i not in assigned:
-                self.trackers.append(KalmanBoxTracker(dets[i,:4]))
+        pairs.sort(key=lambda x: x[0], reverse=True)
 
+        for ciou, d, t_idx in pairs:
+            if d in used_dets or t_idx in used_trks:
+                continue
+            self.trackers[t_idx].update(dets[d, :4])
+            used_dets.add(d)
+            used_trks.add(t_idx)
+
+        # 4) Cria novos trackers para dets não usados
+        for d in range(len(dets)):
+            if d not in used_dets:
+                self.trackers.append(KalmanBoxTracker(dets[d, :4]))
+
+        # 5) Retorna trackers “confiáveis” no frame atual
+        ret = []
         for t in self.trackers:
             if t.time_since_update < 1 and (t.hits >= self.min_hits or self.frame_count <= self.min_hits):
                 ret.append((t.get_state(), t.id))
@@ -200,13 +260,15 @@ class Sort:
 
 # ------------------- OCR Helpers -------------------
 def label_to_char(name):
-    if not name: return None
+    if not name:
+        return None
     s = str(name).strip().upper()
     m = re.search(r'([A-Z0-9])', s)
     return m.group(1) if m else None
 
 def ordenar_e_montar_string(char_dets):
-    if not char_dets: return ""
+    if not char_dets:
+        return ""
     centers = [(d[0] + d[2]) / 2 for d in char_dets]
     idx = np.argsort(centers)
     return ''.join([char_dets[i][4] for i in idx])
@@ -215,31 +277,60 @@ def get_class_name(model, cls_idx):
     try:
         names = model.names
         return names[int(cls_idx)] if isinstance(names, (list, tuple)) else names.get(int(cls_idx))
-    except: return None
+    except:
+        return None
 
 def redimensionar_placa(crop, target_h=120):
     h, w = crop.shape[:2]
-    if h == 0: return crop
+    if h == 0:
+        return crop
     escala = target_h / h
-    return cv2.resize(crop, (int(w * escala), target_h))
+    new_w = max(1, int(w * escala))
+    return cv2.resize(crop, (new_w, target_h))
 
 # ------------------- EasyOCR Geral -------------------
 def easyocr_read(crop):
+    """
+    Correção/performance:
+    - 1 única chamada com detail=1
+    - extrai texto + conf média das caixas retornadas
+    """
     try:
-        result = easyocr_reader.readtext(crop, detail=0, paragraph=False)
-        texto = ''.join([re.sub(r'[^A-Z0-9]', '', t.upper()) for t in result])
-        conf = np.mean([r[2] for r in easyocr_reader.readtext(crop, detail=1) if len(r[0]) > 0]) if result else 0
+        result = easyocr_reader.readtext(
+            crop,
+            detail=1,
+            paragraph=False,
+            allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        )
+        if not result:
+            return "", 0.0
+
+        texts = []
+        confs = []
+        for r in result:
+            # r = [bbox, text, conf]
+            txt = re.sub(r'[^A-Z0-9]', '', str(r[1]).upper())
+            if txt:
+                texts.append(txt)
+            confs.append(float(r[2]) if len(r) > 2 else 0.0)
+
+        texto = ''.join(texts)
+        conf = float(np.mean(confs)) if confs else 0.0
         return texto, round(conf, 3)
     except:
         return "", 0.0
 
 # ------------------- Fusão YOLO + EasyOCR -------------------
 def fuse_yolo_easy(yolo_str, easy_str):
-    if not yolo_str: return easy_str
-    if not easy_str: return yolo_str
+    if not yolo_str:
+        return easy_str
+    if not easy_str:
+        return yolo_str
+
     max_len = max(len(yolo_str), len(easy_str))
     y = yolo_str.ljust(max_len, '?')
     e = easy_str.ljust(max_len, '?')
+
     fused = []
     for yc, ec in zip(y, e):
         if yc == ec:
@@ -253,23 +344,47 @@ def fuse_yolo_easy(yolo_str, easy_str):
     return ''.join(fused)
 
 # ------------------- ANÁLISE DETALHADA (Zoom por char) -------------------
-def do_detailed_ocr(original_crop, yolo_char_dets):
+def do_detailed_ocr(original_crop, yolo_char_dets, resized_shape):
+    """
+    Correção importante:
+    - char_dets vieram do crop_resized (dimensões resized_shape)
+    - converte bbox do espaço do crop_resized -> espaço do high_res
+    """
     if not yolo_char_dets or len(yolo_char_dets) < 3:
         return "", 0.0
 
-    # Alta resolução
+    # Alta resolução (base para recortar chars)
     high_res = redimensionar_placa(original_crop, target_h=180)
-    h_ratio = high_res.shape[0] / original_crop.shape[0]
-    w_ratio = high_res.shape[1] / original_crop.shape[1]
+
+    # ratios: resized -> high_res (não original_crop)
+    rh, rw = resized_shape[:2]
+    hh, hw = high_res.shape[:2]
+    if rh <= 0 or rw <= 0:
+        return "", 0.0
+
+    x_ratio = hw / rw
+    y_ratio = hh / rh
 
     chars = []
     total_conf = 0.0
-    valid_count = 0
 
     for det in yolo_char_dets:
         cx1, cy1, cx2, cy2, ch, conf = det
-        x1 = int(cx1 * w_ratio); y1 = int(cy1 * h_ratio)
-        x2 = int(cx2 * w_ratio); y2 = int(cy2 * h_ratio)
+
+        x1 = int(cx1 * x_ratio); y1 = int(cy1 * y_ratio)
+        x2 = int(cx2 * x_ratio); y2 = int(cy2 * y_ratio)
+
+        # clamp
+        x1 = max(0, min(hw - 1, x1))
+        x2 = max(0, min(hw, x2))
+        y1 = max(0, min(hh - 1, y1))
+        y2 = max(0, min(hh, y2))
+
+        if x2 <= x1 or y2 <= y1:
+            chars.append(ch)
+            total_conf += 0.3
+            continue
+
         char_crop = high_res[y1:y2, x1:x2]
         if char_crop.size == 0 or char_crop.shape[0] < 10 or char_crop.shape[1] < 10:
             chars.append(ch)
@@ -277,22 +392,38 @@ def do_detailed_ocr(original_crop, yolo_char_dets):
             continue
 
         # Pré-processamento
-        gray = cv2.cvtColor(char_crop, cv2.COLOR_BGR2GRAY)
+        try:
+            gray = cv2.cvtColor(char_crop, cv2.COLOR_BGR2GRAY)
+        except:
+            gray = char_crop if len(char_crop.shape) == 2 else cv2.cvtColor(char_crop, cv2.COLOR_BGR2GRAY)
+
         clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
         enhanced = clahe.apply(gray)
         resized = cv2.resize(enhanced, (64, 64))
 
         try:
             result = easyocr_reader.readtext(
-                resized, detail=1, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-                paragraph=False, width_ths=0.7, height_ths=0.7
+                resized,
+                detail=1,
+                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                paragraph=False,
+                width_ths=0.7,
+                height_ths=0.7
             )
-            if result and result[0][2] > 0.4:
-                new_char = result[0][1]
-                conf = result[0][2]
-                chars.append(new_char)
-                total_conf += conf
-                valid_count += 1
+            if result:
+                # pega melhor por conf
+                result.sort(key=lambda r: float(r[2]) if len(r) > 2 else 0.0, reverse=True)
+                best = result[0]
+                best_txt = re.sub(r'[^A-Z0-9]', '', str(best[1]).upper())
+                best_conf = float(best[2]) if len(best) > 2 else 0.0
+
+                if best_txt and best_conf > 0.4:
+                    # Se vier mais de 1 char, pega só 1 (placa por char)
+                    chars.append(best_txt[0])
+                    total_conf += best_conf
+                else:
+                    chars.append(ch)
+                    total_conf += 0.3
             else:
                 chars.append(ch)
                 total_conf += 0.3
@@ -306,7 +437,8 @@ def do_detailed_ocr(original_crop, yolo_char_dets):
 
 # ------------------- Pós-processamento -------------------
 def normalizar_placa_bruta(txt):
-    if not txt: return ""
+    if not txt:
+        return ""
     t = re.sub(r'[^A-Z0-9]', '', str(txt).upper())
     return t if 1 <= len(t) <= MAX_PLATE_STR_LEN else ""
 
@@ -316,6 +448,7 @@ def regex_valida(txt):
 log("Iniciando Fase 1: Detecção + Tracking + OCR...")
 
 # ------------------- Modelos -------------------
+# >>> NÃO MEXIDO: inputs manuais (você define esses caminhos antes de rodar) <<<
 plate_model   = YOLO(plate_model_path)
 char_model    = YOLO(char_model_path)
 vehicle_model = YOLO(vehicle_model_path)
@@ -336,8 +469,21 @@ with open(csv_bruto, "w", newline="", encoding="utf-8") as f:
 CSV_BUFFER = []
 
 # ------------------- Vídeo -------------------
-cap = cv2.VideoCapture(video_path)
+cap = cv2.VideoCapture(video_path)  # >>> NÃO MEXIDO: input manual <<<
+if not cap.isOpened():
+    raise RuntimeError(f"Não consegui abrir o vídeo: {video_path}")
+
 fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+# VideoWriter (agora realmente salva output_video)
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+video_out = cv2.VideoWriter(output_video, fourcc, fps, (frame_w, frame_h))
+if not video_out.isOpened():
+    log("Aviso: não foi possível abrir VideoWriter; vídeo anotado não será salvo.")
+    video_out = None
+
 frame_id = 0
 
 # ------------------- SORT -------------------
@@ -405,7 +551,7 @@ while cap.isOpened():
                 ])
 
     # ------------------- SORT -------------------
-    dets = np.array([d[:5] for d in plate_dets]) if plate_dets else np.empty((0,5))
+    dets = np.array([d[:5] for d in plate_dets], dtype=float) if plate_dets else np.empty((0,5))
     tracked = tracker.update(dets)
 
     # ================================
@@ -413,7 +559,7 @@ while cap.isOpened():
     # ================================
     for bbox, track_id in tracked:
         x1, y1, x2, y2 = map(int, bbox)
-        plate_bbox = (x1,y1,x2,y2)
+        plate_bbox = (x1, y1, x2, y2)
 
         # --- Associação placa ↔ veículo ---
         vehicle_id = associate_plate_vehicle(
@@ -430,7 +576,15 @@ while cap.isOpened():
                 break
 
         # --- Crop ---
-        crop = frame[y1:y2, x1:x2]
+        x1c = max(0, min(w-1, x1))
+        x2c = max(0, min(w,   x2))
+        y1c = max(0, min(h-1, y1))
+        y2c = max(0, min(h,   y2))
+
+        if x2c <= x1c or y2c <= y1c:
+            continue
+
+        crop = frame[y1c:y2c, x1c:x2c]
         if crop.size == 0:
             continue
 
@@ -449,11 +603,11 @@ while cap.isOpened():
                     cx1, cy1, cx2, cy2 = map(float, cb.xyxy[0].tolist())
                     ch = label_to_char(get_class_name(char_model, int(cb.cls[0])))
                     if ch:
-                        char_dets.append((cx1,cy1,cx2,cy2,ch,float(cb.conf[0])))
+                        char_dets.append((cx1, cy1, cx2, cy2, ch, float(cb.conf[0])))
 
             yolo_text = ordenar_e_montar_string(char_dets)
             yolo_n = len(char_dets)
-            yolo_conf = np.mean([d[5] for d in char_dets]) if char_dets else 0.0
+            yolo_conf = float(np.mean([d[5] for d in char_dets])) if char_dets else 0.0
         except:
             pass
 
@@ -467,7 +621,11 @@ while cap.isOpened():
         detailed_text = ""
         detailed_conf = 0.0
         if is_detailed_frame:
-            detailed_text, detailed_conf = do_detailed_ocr(crop, char_dets)
+            detailed_text, detailed_conf = do_detailed_ocr(
+                original_crop=crop,
+                yolo_char_dets=char_dets,
+                resized_shape=crop_resized.shape
+            )
             if detailed_text:
                 fused_text = detailed_text
 
@@ -481,33 +639,36 @@ while cap.isOpened():
 
             CSV_BUFFER.append([
                 frame_id, track_id,
-                yolo_text, yolo_n, round(yolo_conf,3),
-                easy_text, round(easy_conf,3),
+                yolo_text, yolo_n, round(yolo_conf, 3),
+                easy_text, round(easy_conf, 3),
                 fused_text,
-                detailed_text, round(detailed_conf,3), weight,
+                detailed_text, round(detailed_conf, 3), weight,
                 plate_source, vehicle_id if vehicle_id is not None else -1,
-                crop_path, x1,y1,x2,y2
+                crop_path, x1c, y1c, x2c, y2c
             ])
 
             if len(CSV_BUFFER) >= BUFFER_SIZE:
                 flush_csv()
 
         # ------------------- Desenho -------------------
-        cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+        cv2.rectangle(frame, (x1c, y1c), (x2c, y2c), (0, 255, 0), 2)
         if vehicle_id is not None and vehicle_id >= 0:
-            vx1,vy1,vx2,vy2 = vehicle_boxes_xyxy[vehicle_id]
-            cv2.rectangle(frame,(vx1,vy1),(vx2,vy2),(255,0,0),2)
+            vx1, vy1, vx2, vy2 = vehicle_boxes_xyxy[vehicle_id]
+            cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (255, 0, 0), 2)
+
+    # escreve frame anotado no vídeo
+    if video_out is not None:
+        video_out.write(frame)
 
 # ------------------- Finalização -------------------
 cap.release()
+if video_out is not None:
+    video_out.release()
 flush_csv()
-log("Fase 1 concluída com sucesso.")
+log(f"Fase 1 concluída com sucesso. Vídeo anotado: {output_video}")
 
 # ------------------- Fase 2: Consenso OCR + Contexto Veicular -------------------
 log("Iniciando Fase 2: Consenso OCR + consistência veicular...")
-
-from collections import defaultdict
-import pandas as pd
 
 try:
     df = pd.read_csv(csv_bruto)
@@ -518,7 +679,6 @@ except Exception as e:
 if df.empty:
     log("CSV bruto vazio. Encerrando Fase 2.")
 else:
-    # === Normalizações ===
     df['detailed_text'] = df['detailed_text'].fillna('').astype(str)
     df['fused_text'] = df['fused_text'].fillna('').astype(str)
     df['weight'] = pd.to_numeric(df['weight'], errors='coerce').fillna(1.0)
@@ -532,12 +692,11 @@ else:
 
     final_rows = []
 
-    # ================= LOOP POR PLACA =================
     for track_id, group in df.groupby("track_id"):
         if len(group) < MIN_APPEARANCES:
             continue
 
-        # ---------- 1️⃣ CONSENSO OCR COM PESO ----------
+        # ---------- 1) CONSENSO OCR COM PESO ----------
         scores = defaultdict(float)
 
         for _, row in group.iterrows():
@@ -551,42 +710,46 @@ else:
             if fused_text and len(fused_text) >= 6:
                 candidates.append((fused_text, float(row['weight'])))
 
-            for plate, w in candidates:
+            for plate, wgt in candidates:
                 norm = normalizar_placa_bruta(plate)
                 if regex_valida(norm):
-                    scores[norm] += w
+                    scores[norm] += wgt
 
         if not scores:
             continue
 
         final_plate = max(scores, key=scores.get)
-        total_weight = sum(scores.values())
+        total_weight = float(scores[final_plate])  # CORREÇÃO: peso do vencedor
 
-        # ---------- 2️⃣ MÉTRICAS TEMPORAIS ----------
+        # ---------- 2) MÉTRICAS TEMPORAIS ----------
         first_frame = int(group["frame_id"].min())
         last_frame = int(group["frame_id"].max())
-        appearances = len(group)
+        appearances = int(len(group))
 
-        # ---------- 3️⃣ MÉTRICAS VEICULARES ----------
-        vehicle_counts = group['vehicle_id'].value_counts()
+        # ---------- 3) MÉTRICAS VEICULARES (CORREÇÃO: ignora -1) ----------
+        valid_vehicle = group[group['vehicle_id'] >= 0]
+        if valid_vehicle.empty:
+            vehicle_consistency = 0.0
+            main_vehicle = -1
+        else:
+            vehicle_counts = valid_vehicle['vehicle_id'].value_counts()
+            main_vehicle = int(vehicle_counts.idxmax())
+            vehicle_consistency = float(vehicle_counts.max() / vehicle_counts.sum())
 
-        main_vehicle = int(vehicle_counts.idxmax())
-        vehicle_consistency = vehicle_counts.max() / vehicle_counts.sum()
+        plate_source_ratio = float((group['plate_source'] == 'vehicle').mean())
 
-        plate_source_ratio = (group['plate_source'] == 'vehicle').mean()
-
-        # ---------- 4️⃣ SCORE FINAL (OBJETIVO) ----------
+        # ---------- 4) SCORE FINAL (OBJETIVO) ----------
         score_final = (
             0.4 * min(vehicle_consistency, 1.0) +
             0.3 * min(plate_source_ratio, 1.0) +
             0.3 * min(appearances / 30, 1.0)
         )
 
-        # ---------- 5️⃣ FILTRO AUTOMÁTICO (OPCIONAL) ----------
+        # ---------- 5) FILTRO AUTOMÁTICO ----------
         if vehicle_consistency < 0.5:
             continue
 
-        # ---------- 6️⃣ LINHA FINAL ----------
+        # ---------- 6) LINHA FINAL ----------
         final_rows.append({
             "track_id": int(track_id),
             "placa_final": final_plate,
@@ -600,7 +763,6 @@ else:
             "last_frame": last_frame
         })
 
-    # ================= SALVAR CSV FINAL =================
     if final_rows:
         final_df = pd.DataFrame(final_rows)
         final_df = final_df.sort_values(
@@ -612,16 +774,15 @@ else:
     else:
         log("Nenhuma placa válida após Fase 2.")
 
-## ------------------- Fase 3: Recorte de Vídeos + ZIP + Download -------------------
+# ------------------- Fase 3: Recorte de Vídeos + ZIP + Download -------------------
 log("Iniciando Fase 3: Recorte de vídeos por placa com bounding box + ZIP...")
 
-# === Configurações ===
 CLIPS_DIR = os.path.join(csv_dir, "clipes_placas")
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 BUFFER_SECONDS = 1.0
 MIN_CLIP_DURATION = 1.0
-ZIP_PATH = os.path.join(csv_dir, "clipes_placas.zip")  # Arquivo final
+ZIP_PATH = os.path.join(csv_dir, "clipes_placas.zip")
 
 # === Carregar CSV bruto para bounding boxes ===
 try:
@@ -637,8 +798,7 @@ except Exception as e:
     log(f"Erro ao carregar CSV bruto: {e}")
     df_raw = pd.DataFrame()
 
-# === Reabrir vídeo ===
-cap_clip = cv2.VideoCapture(video_path)
+cap_clip = cv2.VideoCapture(video_path)  # >>> NÃO MEXIDO: input manual <<<
 if not cap_clip.isOpened():
     log("Erro: Não foi possível abrir o vídeo para recorte.")
 else:
@@ -672,7 +832,15 @@ else:
                     (df_raw['frame_id'] >= start_frame) &
                     (df_raw['frame_id'] <= end_frame)
                 )
-                track_dets = df_raw[mask].set_index('frame_id')[['x1', 'y1', 'x2', 'y2']].to_dict('index')
+
+                # Se tiver duplicata de frame, mantém a bbox com maior área (mais estável)
+                dets_sel = df_raw[mask].copy()
+                if dets_sel.empty:
+                    continue
+                dets_sel["area"] = (dets_sel["x2"] - dets_sel["x1"]).clip(lower=0) * (dets_sel["y2"] - dets_sel["y1"]).clip(lower=0)
+                dets_sel = dets_sel.sort_values(["frame_id", "area"], ascending=[True, False]).drop_duplicates("frame_id", keep="first")
+
+                track_dets = dets_sel.set_index('frame_id')[['x1', 'y1', 'x2', 'y2']].to_dict('index')
 
                 safe_placa = re.sub(r'[^\w]', '_', placa)
                 clip_path = os.path.join(CLIPS_DIR, f"{safe_placa}.mp4")
@@ -695,7 +863,7 @@ else:
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(frame_width - 1, x2), min(frame_height - 1, y2)
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, placa, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        cv2.putText(frame, placa, (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     clip_out.write(frame)
                     current_frame += 1
                     saved = True
@@ -708,7 +876,7 @@ else:
                     if os.path.exists(clip_path):
                         os.remove(clip_path)
 
-    except Exception as e:
+    except Exception:
         log(f"Erro na Fase 3: {traceback.format_exc()}")
     finally:
         cap_clip.release()
