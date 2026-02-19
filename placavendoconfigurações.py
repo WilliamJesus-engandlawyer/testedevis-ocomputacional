@@ -42,10 +42,45 @@ if IN_COLAB:
 else:
     print("Modo local: certifique-se de ter as libs instaladas.")
 
+# fsdfddfgfg
+
+
+
 # ------------------- Imports -------------------
 from ultralytics import YOLO
 from filterpy.kalman import KalmanFilter
 import easyocr
+
+# hjdfhkdfkjhdd
+
+# ------------------- Uploads no Colab -------------------
+if IN_COLAB:
+    from google.colab import files
+    
+    print("Faça upload do modelo de placas (ex: plate_best.pt):")
+    uploaded = files.upload()
+    plate_model_path = list(uploaded.keys())[0] if uploaded else None
+    
+    print("Faça upload do modelo de caracteres (ex: char_best.pt):")
+    uploaded = files.upload()
+    char_model_path = list(uploaded.keys())[0] if uploaded else None
+    
+    print("Faça upload do modelo de veículos (ex: yolov8n.pt ou vehicle_best.pt):")
+    uploaded = files.upload()
+    vehicle_model_path = list(uploaded.keys())[0] if uploaded else None
+    
+    print("Faça upload do vídeo de entrada (ex: video.mp4):")
+    uploaded = files.upload()
+    video_path = list(uploaded.keys())[0] if uploaded else None
+    
+    if not all([plate_model_path, char_model_path, vehicle_model_path, video_path]):
+        raise ValueError("Todos os arquivos são necessários para rodar o código.")
+else:
+    # Modo local: Defina manualmente aqui
+    plate_model_path = "caminho/local/plate_best.pt"  # Altere para seu caminho
+    char_model_path = "caminho/local/char_best.pt"    # Altere para seu caminho
+    vehicle_model_path = "caminho/local/vehicle_best.pt"  # Altere para seu caminho
+    video_path = "caminho/local/video.mp4"            # Altere para seu caminho
 
 # ------------------- EasyOCR Reader -------------------
 print("Inicializando EasyOCR (GPU recomendado)...")
