@@ -714,66 +714,85 @@ if video_out is not None:
 flush_csv()
 log(f"Fase 1 concluída com sucesso. Vídeo anotado: {output_video}")
 
-# ------------------- Fase 2: Consenso OCR + Contexto Veicular -------------------
-log("Iniciando Fase 2: Consenso OCR + consistência veicular...")
+# ------------------- Parâmetros Adicionais para Fase 2 -------------------
+MIN_APPEARANCES = 2  # Reduzido para mais flexibilidade
+MIN_CHARS_CONSENSUS = 3  # Aceita candidatos a partir de 3 chars
+MIN_VEHICLE_CONSISTENCY = 0.3  # Threshold mais baixo para não descartar tanto
+MIN_SCORE_FINAL = 0.4  # Novo: Score mínimo para salvar track
+FORMATS = {
+    "antigo_br": r'^[A-Z]{3}[0-9]{4}$',
+    "mercosul_br": r'^[A-Z]{3}[0-9][A-Z][0-9]{2}$',
+    "generico": r'^[A-Z0-9]{6,8}$',  # Para placas internacionais ou parciais
+    "parcial": r'^[A-Z0-9]{3,5}$',   # Para detecções incompletas (útil em depuração)
+}
+from Levenshtein import distance as lev_dist  # Para fusão de variantes semelhantes
 
+log("Iniciando Nova Fase 2: Consenso OCR + consistência veicular (versão melhorada)...")
 try:
     df = pd.read_csv(csv_bruto)
 except Exception as e:
     log(f"Erro ao ler CSV bruto: {e}")
     df = pd.DataFrame()
-
 if df.empty:
     log("CSV bruto vazio. Encerrando Fase 2.")
 else:
     df['detailed_text'] = df['detailed_text'].fillna('').astype(str)
     df['fused_text'] = df['fused_text'].fillna('').astype(str)
+    df['yolo_text'] = df['yolo_text'].fillna('').astype(str)
+    df['easy_text'] = df['easy_text'].fillna('').astype(str)
     df['weight'] = pd.to_numeric(df['weight'], errors='coerce').fillna(1.0)
-
-    df['vehicle_id'] = (
-        pd.to_numeric(df['vehicle_id'], errors='coerce')
-        .fillna(-1)
-        .astype(int)
-    )
+    df['vehicle_id'] = pd.to_numeric(df['vehicle_id'], errors='coerce').fillna(-1).astype(int)
     df['plate_source'] = df['plate_source'].fillna("unknown")
-
+    
     final_rows = []
-
     for track_id, group in df.groupby("track_id"):
-        if len(group) < MIN_APPEARANCES:
+        appearances = len(group)
+        if appearances < MIN_APPEARANCES:
+            log(f"Track {track_id} ignorado: aparições < {MIN_APPEARANCES} ({appearances})")
             continue
-
-        # ---------- 1) CONSENSO OCR COM PESO ----------
-        scores = defaultdict(float)
-
+        
+        # ---------- 1) CONSENSO OCR COM PESO (Mais candidatos) ----------
+        candidates = []
         for _, row in group.iterrows():
-            candidates = []
-
-            det_text = row['detailed_text'].strip()
-            if det_text and len(det_text) >= 6:
-                candidates.append((det_text, float(row['weight'])))
-
-            fused_text = row['fused_text'].strip()
-            if fused_text and len(fused_text) >= 6:
-                candidates.append((fused_text, float(row['weight'])))
-
-            for plate, wgt in candidates:
-                norm = normalizar_placa_bruta(plate)
-                if regex_valida(norm):
-                    scores[norm] += wgt
-
-        if not scores:
+            texts = [row['detailed_text'].strip(), row['fused_text'].strip(), row['yolo_text'].strip(), row['easy_text'].strip()]
+            for txt in texts:
+                if txt and len(txt) >= MIN_CHARS_CONSENSUS:
+                    norm = normalizar_placa_bruta(txt)
+                    candidates.append((norm, float(row['weight'])))
+        
+        if not candidates:
+            log(f"Track {track_id} ignorado: nenhum candidato válido (>= {MIN_CHARS_CONSENSUS} chars)")
             continue
-
-        final_plate = max(scores, key=scores.get)
-        total_weight = float(scores[final_plate])  # CORREÇÃO: peso do vencedor
-
+        
+        # Fusão de variantes semelhantes (usando Levenshtein para agrupar próximas)
+        unique_plates = list(set([c[0] for c in candidates]))
+        if len(unique_plates) > VARIANT_LIMIT:
+            log(f"Track {track_id}: Limitando variantes a {VARIANT_LIMIT}")
+            unique_plates = unique_plates[:VARIANT_LIMIT]
+        
+        scores = defaultdict(float)
+        for plate, wgt in candidates:
+            # Encontra similar mais próxima e soma score
+            best_match = min(unique_plates, key=lambda p: lev_dist(plate, p))
+            if lev_dist(plate, best_match) <= 1:  # Tolerância de 1 erro
+                scores[best_match] += wgt
+            else:
+                scores[plate] += wgt
+        
+        # Validação por regex (prioriza formatos BR, mas aceita genérico/parcial)
+        valid_scores = {p: s for p, s in scores.items() if any(re.fullmatch(regex, p) for regex in FORMATS.values())}
+        if not valid_scores:
+            log(f"Track {track_id} ignorado: nenhum match em regex de formatos")
+            continue
+        
+        final_plate = max(valid_scores, key=valid_scores.get)
+        total_weight = float(valid_scores[final_plate])
+        
         # ---------- 2) MÉTRICAS TEMPORAIS ----------
         first_frame = int(group["frame_id"].min())
         last_frame = int(group["frame_id"].max())
-        appearances = int(len(group))
-
-        # ---------- 3) MÉTRICAS VEICULARES (CORREÇÃO: ignora -1) ----------
+        
+        # ---------- 3) MÉTRICAS VEICULARES (Penaliza baixa consistency, mas não descarta) ----------
         valid_vehicle = group[group['vehicle_id'] >= 0]
         if valid_vehicle.empty:
             vehicle_consistency = 0.0
@@ -782,51 +801,59 @@ else:
             vehicle_counts = valid_vehicle['vehicle_id'].value_counts()
             main_vehicle = int(vehicle_counts.idxmax())
             vehicle_consistency = float(vehicle_counts.max() / vehicle_counts.sum())
-
+        
         plate_source_ratio = float((group['plate_source'] == 'vehicle').mean())
-
-        # ---------- 4) SCORE FINAL (OBJETIVO) ----------
+        
+        # ---------- 4) MÉTRICAS OCR (Novo: qualidade média) ----------
+        mean_ocr_conf = float(np.mean([
+            group['yolo_mean_conf'].mean(),
+            group['easy_conf'].mean(),
+            group['detailed_conf'].mean()
+        ]))
+        
+        # ---------- 5) SCORE FINAL (Mais equilibrado) ----------
         score_final = (
-            0.4 * min(vehicle_consistency, 1.0) +
-            0.3 * min(plate_source_ratio, 1.0) +
-            0.3 * min(appearances / 30, 1.0)
+            0.3 * min(vehicle_consistency, 1.0) +  # Reduzido peso
+            0.2 * min(plate_source_ratio, 1.0) +
+            0.2 * min(appearances / 30, 1.0) +
+            0.3 * min(mean_ocr_conf, 1.0)  # Novo peso para qualidade OCR
         )
-
-        # ---------- 5) FILTRO AUTOMÁTICO ----------
-        if vehicle_consistency < 0.5:
-            continue
-
-        # ---------- 6) LINHA FINAL ----------
-        final_rows.append({
+        
+        # ---------- 6) FILTRO FINAL (Novo threshold ajustável) ----------
+        reason_ignored = None
+        if score_final < MIN_SCORE_FINAL:
+            reason_ignored = f"Score final baixo: {score_final:.3f} < {MIN_SCORE_FINAL}"
+            log(f"Track {track_id} ignorado: {reason_ignored}")
+        
+        # ---------- 7) LINHA FINAL (Salva mesmo ignorados para depuração) ----------
+        row = {
             "track_id": int(track_id),
-            "placa_final": final_plate,
+            "placa_final": final_plate if not reason_ignored else "",
             "appearances": appearances,
             "total_weight": round(total_weight, 2),
             "vehicle_id": main_vehicle,
             "vehicle_consistency": round(vehicle_consistency, 3),
             "plate_source_ratio": round(plate_source_ratio, 3),
+            "mean_ocr_conf": round(mean_ocr_conf, 3),
             "score_final": round(score_final, 3),
             "first_frame": first_frame,
-            "last_frame": last_frame
-        })
-
+            "last_frame": last_frame,
+            "reason_ignored": reason_ignored or ""
+        }
+        final_rows.append(row)
+    
     if final_rows:
         final_df = pd.DataFrame(final_rows)
-        final_df = final_df.sort_values(
-            ["score_final", "appearances"],
-            ascending=[False, False]
-        )
+        final_df = final_df.sort_values(["score_final", "appearances"], ascending=[False, False])
         final_df.to_csv(csv_final, index=False)
-        log(f"CSV final salvo: {csv_final} | {len(final_df)} placas consolidadas")
+        log(f"CSV final salvo: {csv_final} | {len(final_df[final_df['placa_final'] != ''])} placas consolidadas (total rows: {len(final_df)})")
     else:
-        log("Nenhuma placa válida após Fase 2.")
-
-# ------------------- Fase 3: Recorte de Vídeos + ZIP + Download -------------------
-log("Iniciando Fase 3: Recorte de vídeos por placa com bounding box + ZIP...")
-
+        pd.DataFrame(columns=final_rows[0].keys() if final_rows else []).to_csv(csv_final, index=False)  # CSV vazio para Fase 3
+        log("Nenhuma placa processada na Fase 2 (CSV vazio gerado).")
+        
+log("Iniciando Nova Fase 3: Recorte de vídeos por placa com bounding box + ZIP (integrada com nova Fase 2)...")
 CLIPS_DIR = os.path.join(csv_dir, "clipes_placas")
 os.makedirs(CLIPS_DIR, exist_ok=True)
-
 BUFFER_SECONDS = 1.0
 MIN_CLIP_DURATION = 1.0
 ZIP_PATH = os.path.join(csv_dir, "clipes_placas.zip")
@@ -845,7 +872,7 @@ except Exception as e:
     log(f"Erro ao carregar CSV bruto: {e}")
     df_raw = pd.DataFrame()
 
-cap_clip = cv2.VideoCapture(video_path)  # >>> NÃO MEXIDO: input manual <<<
+cap_clip = cv2.VideoCapture(video_path)
 if not cap_clip.isOpened():
     log("Erro: Não foi possível abrir o vídeo para recorte.")
 else:
@@ -855,49 +882,48 @@ else:
     total_frames = int(cap_clip.get(cv2.CAP_PROP_FRAME_COUNT))
     buffer_frames = int(BUFFER_SECONDS * fps_clip)
     clips_criados = 0
-
     try:
         if not os.path.exists(csv_final):
             log("Aviso: CSV final não encontrado. Fase 3 ignorada.")
         else:
             df_final = pd.read_csv(csv_final)
-            for _, row in df_final.iterrows():
+            # Filtra só tracks válidos (placa_final não vazia)
+            df_final_valid = df_final[df_final['placa_final'] != '']
+            if df_final_valid.empty:
+                log("Nenhum track válido no CSV final (todos ignorados). Nenhum clipe gerado.")
+            for _, row in df_final_valid.iterrows():
                 placa = str(row['placa_final']).strip()
                 track_id = int(row['track_id'])
                 first_frame = int(row['first_frame'])
                 last_frame = int(row['last_frame'])
-
+                score_final = row['score_final']
                 start_frame = max(0, first_frame - buffer_frames)
                 end_frame = min(total_frames - 1, last_frame + buffer_frames)
                 duration_sec = (end_frame - start_frame + 1) / fps_clip
                 if duration_sec < MIN_CLIP_DURATION:
                     log(f"Clip ignorado (curto): {placa} | {duration_sec:.1f}s")
                     continue
-
+                
                 mask = (
                     (df_raw['track_id'] == track_id) &
                     (df_raw['frame_id'] >= start_frame) &
                     (df_raw['frame_id'] <= end_frame)
                 )
-
-                # Se tiver duplicata de frame, mantém a bbox com maior área (mais estável)
                 dets_sel = df_raw[mask].copy()
                 if dets_sel.empty:
                     continue
                 dets_sel["area"] = (dets_sel["x2"] - dets_sel["x1"]).clip(lower=0) * (dets_sel["y2"] - dets_sel["y1"]).clip(lower=0)
                 dets_sel = dets_sel.sort_values(["frame_id", "area"], ascending=[True, False]).drop_duplicates("frame_id", keep="first")
-
                 track_dets = dets_sel.set_index('frame_id')[['x1', 'y1', 'x2', 'y2']].to_dict('index')
-
+                
                 safe_placa = re.sub(r'[^\w]', '_', placa)
-                clip_path = os.path.join(CLIPS_DIR, f"{safe_placa}.mp4")
-
+                clip_path = os.path.join(CLIPS_DIR, f"{safe_placa}_track{track_id}.mp4")
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 clip_out = cv2.VideoWriter(clip_path, fourcc, fps_clip, (frame_width, frame_height))
                 if not clip_out.isOpened():
                     log(f"Falha ao criar VideoWriter: {clip_path}")
                     continue
-
+                
                 cap_clip.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
                 current_frame = start_frame
                 saved = False
@@ -910,31 +936,29 @@ else:
                         x1, y1 = max(0, x1), max(0, y1)
                         x2, y2 = min(frame_width - 1, x2), min(frame_height - 1, y2)
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, placa, (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        cv2.putText(frame, f"{placa} (Track {track_id}, Score: {score_final:.2f})", (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     clip_out.write(frame)
                     current_frame += 1
                     saved = True
+                
                 clip_out.release()
-
                 if saved:
                     log(f"Clip salvo: {clip_path} | {placa}")
                     clips_criados += 1
                 else:
                     if os.path.exists(clip_path):
                         os.remove(clip_path)
-
     except Exception:
         log(f"Erro na Fase 3: {traceback.format_exc()}")
     finally:
         cap_clip.release()
-
+    
     # === COMPACTAR E FAZER DOWNLOAD ===
     if clips_criados > 0 and os.path.exists(CLIPS_DIR):
         import shutil
         log(f"Compactando {clips_criados} clipes em {ZIP_PATH}...")
         shutil.make_archive(ZIP_PATH.replace('.zip', ''), 'zip', CLIPS_DIR)
         log(f"ZIP criado: {ZIP_PATH}")
-
         if IN_COLAB:
             try:
                 from google.colab import files
@@ -947,5 +971,5 @@ else:
             log(f"Clipes compactados em: {ZIP_PATH}")
     else:
         log("Nenhum clipe gerado para compactar.")
-
+    
     log(f"Fase 3 concluída: {clips_criados} clipes → {ZIP_PATH}")
